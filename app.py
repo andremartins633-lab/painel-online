@@ -29,7 +29,13 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
+
+# 🔧 CORREÇÃO: normaliza a chave privada (corrige \\n -> \n)
+sa_info = dict(st.secrets["gcp_service_account"])
+if isinstance(sa_info.get("private_key"), str):
+    sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
+
+creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
 gc = gspread.authorize(creds)
 
 # extrai ID da planilha para fallback
@@ -155,3 +161,4 @@ try:
 except Exception as e:
     st.error(f"Erro ao ler L1:N14: {e}")
     st.caption("Confirme se as fórmulas e referências estão corretas na planilha.")
+
