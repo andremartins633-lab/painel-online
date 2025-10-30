@@ -1,44 +1,72 @@
-import streamlit as st
+import re
 import pandas as pd
+import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ========= CONFIG =========
-# Defina em st.secrets:
-# st.secrets["gcp_service_account"] = {... json do service account ...}
-# st.secrets["sheet_url"] = "https://docs.google.com/spreadsheets/d/SEU_ID/edit"
-# st.secrets["sheet_name"] = "PAINEL"   # nome da aba com seu layout
+# =========================
+# Configurações do App
+# =========================
+st.set_page_config(page_title="Painel Online (Google Sheets)", layout="wide")
+st.title("Painel Online — baseado no seu Excel (rodando no Google Sheets)")
+st.caption("A1:E31 = entrada | F:J = fórmulas (no Sheets) | L1:N14 = resultados")
+
+# Lê Secrets
 SHEET_URL = st.secrets["sheet_url"]
 SHEET_NAME = st.secrets.get("sheet_name", "PAINEL")
+SERVICE_EMAIL = st.secrets["gcp_service_account"]["client_email"]
+st.caption(f"Conectando como: {SERVICE_EMAIL}")
 
 # Faixas fixas
-INPUT_RANGE = "A1:E31"    # área de digitação
-RESULT_RANGE = "L1:N14"   # resultados
-# F:J ficam no Sheets como fórmulas, você não precisa mexer aqui.
+INPUT_RANGE = "A1:E31"     # área de edição (com cabeçalho em A1:E1)
+RESULT_RANGE = "L1:N14"    # resultados
+PAISES = ["Bolivia", "Paraguai", "Argentina"]  # dropdown da coluna D
 
-# Opções da lista suspensa (coluna D)
-PAISES = ["Bolivia", "Paraguai", "Argentina"]
-
-# ========= GSPREAD CLIENT =========
+# =========================
+# Conexão com Google APIs
+# =========================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-creds = Credentials.from_service_account_info(
-    st.secrets["gcp_service_account"], scopes=SCOPES
-)
+creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
 gc = gspread.authorize(creds)
-sh = gc.open_by_url(SHEET_URL)
-ws = sh.worksheet(SHEET_NAME)
 
-st.set_page_config(page_title="Painel Online (Google Sheets)", layout="wide")
-st.title("Painel Online — Modelo baseado no Excel (agora no Google Sheets)")
-st.caption("A1:E31 = entrada | F:J = fórmulas | L1:N14 = resultados")
+# extrai ID da planilha para fallback
+m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", SHEET_URL)
+SHEET_ID = m.group(1) if m else None
 
-# ========= FUNÇÕES AUX =========
-def read_range_as_df(worksheet, rng, headers=True, width=None, height=None):
-    vals = worksheet.get(rng, value_render_option="UNFORMATTED_VALUE") or []
-    # Pad right/bottom para manter grade estável
+def open_sheet():
+    try:
+        # preferimos por ID, é mais robusto (URL pode ter querystring ?gid=)
+        if SHEET_ID:
+            return gc.open_by_key(SHEET_ID)
+        return gc.open_by_url(SHEET_URL)
+    except gspread.exceptions.SpreadsheetNotFound:
+        st.error("Planilha não encontrada. Confira `sheet_url` nos Secrets e se a Service Account tem acesso (Editor).")
+        st.caption(f"Service account: {SERVICE_EMAIL}")
+        st.stop()
+    except gspread.exceptions.APIError:
+        st.error("Falha de API ao abrir a planilha. Habilite as APIs **Google Sheets** e **Google Drive** no projeto do seu JSON.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Erro ao abrir a planilha: {e}")
+        st.caption(f"Service account: {SERVICE_EMAIL}")
+        st.stop()
+
+try:
+    sh = open_sheet()
+    ws = sh.worksheet(SHEET_NAME)
+except gspread.exceptions.WorksheetNotFound:
+    st.error(f"Aba '{SHEET_NAME}' não encontrada. Verifique `sheet_name` nos Secrets.")
+    st.stop()
+
+# =========================
+# Utilitários de Range
+# =========================
+def read_range_as_df(worksheet, cell_range: str, headers=True, width=None, height=None):
+    vals = worksheet.get(cell_range, value_render_option="UNFORMATTED_VALUE") or []
+    # Normaliza quantidade de linhas/colunas para manter grade estável
     if height is not None:
         while len(vals) < height:
             vals.append([])
@@ -53,28 +81,37 @@ def read_range_as_df(worksheet, rng, headers=True, width=None, height=None):
         df.columns = [f"Col_{i+1}" for i in range(df.shape[1])]
     return df.fillna("")
 
-def write_df_to_range(worksheet, rng, df, include_headers=True):
+def write_df_to_range(worksheet, cell_range: str, df: pd.DataFrame, include_headers=True):
     data = []
     if include_headers:
         data.append(list(df.columns))
-    data.extend(df.astype(object).where(pd.notnull(df), "").values.tolist())
-    worksheet.update(rng, data, value_input_option="USER_ENTERED")
+    # substitui NaN por string vazia para evitar "nan" no Sheets
+    rows = df.astype(object).where(pd.notnull(df), "").values.tolist()
+    data.extend(rows)
+    worksheet.update(cell_range, data, value_input_option="USER_ENTERED")
 
-# ========= CARREGAR ENTRADAS (A1:E31) =========
-# Se sua primeira linha são cabeçalhos, headers=True. Se não, defina headers=False e forneça nomes.
-df_inputs = read_range_as_df(ws, INPUT_RANGE, headers=True, width=5, height=32)
+# =========================
+# ENTRADA: A1:E31 (com dropdown em D)
+# =========================
+# Vamos ler A1:E31 assumindo que a primeira linha (A1:E1) é cabeçalho.
+# Altura total incluindo cabeçalho = 32 linhas; largura = 5 colunas.
+df_inputs = read_range_as_df(ws, "A1:E32", headers=True, width=5, height=32)
 
-# Garante 31 linhas de dados (sem a linha de cabeçalho)
+# Garante exatamente 31 linhas de dados (sem contar o cabeçalho)
 if df_inputs.shape[0] < 31:
-    # anexa linhas em branco até 31
     add = 31 - df_inputs.shape[0]
-    df_inputs = pd.concat([df_inputs, pd.DataFrame([[""]*df_inputs.shape[1]]*add, columns=df_inputs.columns)], ignore_index=True)
+    df_inputs = pd.concat(
+        [df_inputs, pd.DataFrame([[""] * df_inputs.shape[1]] * add, columns=df_inputs.columns)],
+        ignore_index=True
+    )
+elif df_inputs.shape[0] > 31:
+    df_inputs = df_inputs.iloc[:31].copy()
 
 st.subheader("Entrada (A1:E31)")
-# Config da coluna D como Selectbox (lista suspensa)
+
 col_configs = {}
 if df_inputs.shape[1] >= 4:
-    d_col_name = df_inputs.columns[3]
+    d_col_name = df_inputs.columns[3]  # 4ª coluna = D
     col_configs[d_col_name] = st.column_config.SelectboxColumn(
         label=d_col_name,
         options=PAISES,
@@ -84,7 +121,8 @@ if df_inputs.shape[1] >= 4:
 
 edited = st.data_editor(
     df_inputs,
-    num_rows=31,  # fixa 31 linhas
+    num_rows=31,  # fixa total de linhas
+    hide_index=True,
     use_container_width=True,
     column_config=col_configs,
     key="editor_inputs"
@@ -92,28 +130,28 @@ edited = st.data_editor(
 
 c1, c2 = st.columns(2)
 with c1:
-    if st.button("Salvar no Sheets"):
-        # grava de volta em A1:E31
+    if st.button("Salvar no Sheets", type="primary"):
         try:
-            # Mantém o cabeçalho original
             write_df_to_range(ws, INPUT_RANGE, edited, include_headers=True)
-            st.success("Dados salvos com sucesso!")
-            st.toast("Google Sheets atualizado", icon="✅")
+            st.success("Dados salvos! O Google Sheets recalcula as fórmulas automaticamente.")
+            st.toast("Google Sheets atualizado ✅", icon="✅")
         except Exception as e:
             st.error(f"Erro ao salvar: {e}")
 
 with c2:
-    if st.button("Recarregar"):
+    if st.button("Recarregar da planilha"):
         st.rerun()
 
 st.divider()
 
-# ========= LER RESULTADOS (L1:N14) =========
+# =========================
+# RESULTADOS: L1:N14
+# =========================
 st.subheader("Resultados (L1:N14)")
 try:
-    df_result = read_range_as_df(ws, RESULT_RANGE, headers=True, width=3, height=14)
-    st.dataframe(df_result, use_container_width=True)
+    # Lê 14 linhas (inclui o cabeçalho) e 3 colunas
+    df_result = read_range_as_df(ws, "L1:N14", headers=True, width=3, height=14)
+    st.dataframe(df_result, hide_index=True, use_container_width=True)
 except Exception as e:
     st.error(f"Erro ao ler L1:N14: {e}")
-
-st.caption("Obs.: Cálculos (F:J e demais abas) rodam no Google Sheets.")
+    st.caption("Confirme se as fórmulas e referências estão corretas na planilha.")
